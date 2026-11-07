@@ -1,0 +1,233 @@
+name: devsecops-pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "Tắt Docker layer cache (để đo ảnh hưởng của cache)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NO_CACHE: ${{ inputs.no_cache && 'true' || 'false' }}
+
+# Mỗi lớp kiểm tra là một job song song, chạy cho cả 2 target (vulnerable/fixed).
+# Scanner luôn thoát mã 0 và ghi báo cáo JSON; QUYẾT ĐỊNH chặn/cho qua do job `gate` (gate/gate.py) đảm nhiệm.
+jobs:
+  secrets:  # Lớp 1 - secret scanning
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Gitleaks
+        run: |
+          mkdir -p reports/${{ matrix.target }}
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks dir lab/${{ matrix.target }} --report-format json \
+            --report-path reports/${{ matrix.target }}/gitleaks.json --redact --exit-code 0 --no-banner
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"secrets\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-secrets.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-secrets-${{ matrix.target }}", path: reports/ }
+
+  sast:  # Lớp 2 - SAST
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip, cache-dependency-path: gate/requirements.txt }
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Semgrep
+        run: |
+          pip install -r gate/requirements.txt
+          mkdir -p reports/${{ matrix.target }}
+          semgrep scan --config p/python --config p/flask --metrics=off --json \
+            --output reports/${{ matrix.target }}/semgrep.json lab/${{ matrix.target }}/app
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"sast\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-sast.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-sast-${{ matrix.target }}", path: reports/ }
+
+  sca:  # Lớp 3 - SCA (dependency)
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - run: mkdir -p reports/${{ matrix.target }}
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: lab/${{ matrix.target }}/app
+          scanners: vuln
+          format: json
+          output: reports/${{ matrix.target }}/trivy-fs.json
+          exit-code: "0"
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"sca\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-sca.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-sca-${{ matrix.target }}", path: reports/ }
+
+  iac:  # Lớp 4 - IaC scanning
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip, cache-dependency-path: gate/requirements.txt }
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Checkov
+        run: |
+          pip install -r gate/requirements.txt
+          mkdir -p reports/${{ matrix.target }}
+          checkov -d lab/${{ matrix.target }}/iac --framework terraform -o json --soft-fail \
+            > reports/${{ matrix.target }}/checkov.json
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"iac\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-iac.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-iac-${{ matrix.target }}", path: reports/ }
+
+  policy:  # Lớp 5 - Policy as code (OPA/Conftest) cho Dockerfile
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Conftest
+        run: |
+          mkdir -p reports/${{ matrix.target }}
+          curl -sSL https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_0.56.0_Linux_x86_64.tar.gz | tar xz conftest
+          ./conftest test lab/${{ matrix.target }}/app/Dockerfile --parser dockerfile --policy policy \
+            --all-namespaces -o json > reports/${{ matrix.target }}/conftest.json || true
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"policy\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-policy.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-policy-${{ matrix.target }}", path: reports/ }
+
+  image:  # Lớp 6 - build + image scan + SBOM
+    runs-on: ubuntu-latest
+    strategy: { fail-fast: false, matrix: { target: [vulnerable, fixed] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+      - run: mkdir -p reports/${{ matrix.target }}
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: lab/${{ matrix.target }}/app
+          load: true
+          tags: lab-app:${{ matrix.target }}
+          cache-from: ${{ env.NO_CACHE == 'false' && format('type=gha,scope={0}', matrix.target) || '' }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          no-cache: ${{ env.NO_CACHE == 'true' }}
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: lab-app:${{ matrix.target }}
+          format: json
+          output: reports/${{ matrix.target }}/trivy-image.json
+          exit-code: "0"
+      - name: SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: lab-app:${{ matrix.target }}
+          format: spdx-json
+          output-file: reports/${{ matrix.target }}/sbom.spdx.json
+          upload-artifact: false
+      - name: Timing
+        if: always()
+        run: echo "{\"name\":\"image\",\"seconds\":$(( $(date +%s) - T0 ))}" > reports/${{ matrix.target }}/timing-image.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "reports-image-${{ matrix.target }}", path: reports/ }
+
+  gate:
+    needs: [secrets, sast, sca, iac, policy, image]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml
+      - uses: actions/download-artifact@v4
+        with: { pattern: "reports-*", path: reports, merge-multiple: true }
+      - name: Kiểm chứng lab - bản gieo lỗi PHẢI bị chặn
+        if: always()
+        run: python gate/gate.py --target vulnerable --expect block --out gate-out
+      - name: Kiểm chứng lab - bản đã sửa PHẢI vượt
+        if: always()
+        run: python gate/gate.py --target fixed --expect pass --out gate-out
+      # Bước THỰC SỰ chặn merge: target lấy từ gate/enforce-target.txt (được commit trong Git).
+      # Demo "commit lỗi bị chặn -> sửa -> vượt": commit 1 đặt `vulnerable` (job đỏ), commit 2 đặt `fixed` (job xanh).
+      - name: Gate cưỡng chế (target theo gate/enforce-target.txt)
+        if: always()
+        run: |
+          T=$(tr -d '[:space:]' < gate/enforce-target.txt)
+          python gate/gate.py --target "$T" --expect none --out gate-out/enforce
+      - name: Tổng hợp summary
+        if: always()
+        run: |
+          { [ -f gate-out/enforce/*/summary.md ] && echo "## Kết quả gate cưỡng chế" && cat gate-out/enforce/*/summary.md; echo "## Kiểm chứng lab"; cat gate-out/vulnerable/summary.md gate-out/fixed/summary.md; } > gate-out/summary.md 2>/dev/null || true
+          cat gate-out/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Bình luận tóm tắt lên PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file gate-out/summary.md
+      - name: Tạo báo cáo HTML
+        if: always()
+        run: python scripts/report.py || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: gate-output, path: "gate-out/\nreports/" }
+
+  publish:  # Ký image + đính SBOM (chỉ khi gate qua và push lên main)
+    needs: gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gate.result == 'success'
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: sigstore/cosign-installer@v3
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: lab/fixed/app
+          push: true
+          tags: ghcr.io/${{ github.repository }}/lab-app:${{ github.sha }}
+          cache-from: type=gha,scope=fixed
+      - uses: actions/download-artifact@v4
+        with: { name: reports-image-fixed, path: sbom-dl }
+      - name: Cosign sign (keyless) + attest SBOM
+        run: |
+          IMG=ghcr.io/${{ github.repository }}/lab-app@${{ steps.build.outputs.digest }}
+          cosign sign --yes "$IMG"
+          cosign attest --yes --type spdxjson --predicate sbom-dl/fixed/sbom.spdx.json "$IMG"

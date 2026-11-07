@@ -1,0 +1,18 @@
+# Chính sách security gate (policy as code, có version trong Git)
+# Kết luận: BLOCK (có finding chặn thật, exit 1) > ERROR (thiếu/hỏng báo cáo khi fail_closed, exit 2)
+#           > WARN (chỉ có cảnh báo, exit 0) > PASS (sạch, exit 0)
+block_severities: [CRITICAL, HIGH]     # chặn release
+warn_severities: [MEDIUM]              # chỉ cảnh báo trên PR
+ignore_severities: [LOW, INFO, UNKNOWN]
+always_block_tools: [gitleaks]         # secret: luôn chặn, bất kể mức độ
+block_unfixed_vulns: false             # CVE chưa có bản vá -> chỉ cảnh báo (tránh làm tê liệt dev)
+fail_closed: true                      # thiếu báo cáo của bất kỳ lớp nào -> chặn
+max_exception_days: 90                 # ngoại lệ tối đa 90 ngày (expires - created)
+
+semgrep_severity_map: {ERROR: HIGH, WARNING: MEDIUM, INFO: LOW}
+
+# Checkov OSS không có severity -> map theo ID; ID không có trong map = MEDIUM (cảnh báo)
+checkov_default_severity: MEDIUM
+checkov_severity_overrides:
+  CRITICAL: [CKV_AWS_24, CKV_AWS_25, CKV_AWS_260, CKV_AWS_355, CKV_AWS_289, CKV_AWS_290, CKV_AWS_286, CKV_AWS_287, CKV_AWS_288, CKV_AWS_53, CKV_AWS_54, CKV_AWS_55, CKV_AWS_56]
+  HIGH: [CKV_AWS_17, CKV_AWS_16, CKV_AWS_19, CKV_AWS_20, CKV_AWS_57, CKV_AWS_41, CKV_AWS_382, CKV_AWS_161]

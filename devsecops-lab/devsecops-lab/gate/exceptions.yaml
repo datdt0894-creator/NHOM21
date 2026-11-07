@@ -1,0 +1,19 @@
+# Ngoại lệ có chủ sở hữu và thời hạn. Thiếu owner/reason/created/expires, hoặc quá max_exception_days,
+# hoặc đã hết hạn -> KHÔNG được áp dụng và bị báo cáo trong summary.
+exceptions:
+  # Ví dụ ngoại lệ đã HẾT HẠN (để minh hoạ gate không tôn trọng ngoại lệ quá hạn)
+  - id: CKV_AWS_355
+    scope: "lab/vulnerable"
+    owner: "nguyen.van.a@example.com"
+    reason: "Demo: policy IAM wildcard tạm thời cho môi trường thử nghiệm"
+    ticket: "SEC-101"
+    created: "2026-07-01"
+    expires: "2026-09-30"
+  # Mẫu ngoại lệ hợp lệ - sửa id/owner/ngày khi cần dùng thật
+  # - id: CVE-2099-0000
+  #   scope: "lab/fixed"
+  #   owner: "team-platform@example.com"
+  #   reason: "Chưa có bản vá; đã có biện pháp giảm thiểu WAF"
+  #   ticket: "SEC-102"
+  #   created: "2026-10-29"
+  #   expires: "2026-12-15"

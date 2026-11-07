@@ -1,0 +1,11 @@
+# [SEED-06] Dependency cũ có CVE đã biết (SCA phải phát hiện)
+Flask==1.1.2
+Jinja2==2.11.2
+MarkupSafe==2.0.1
+Werkzeug==1.0.1
+itsdangerous==1.1.0
+click==7.1.2
+PyYAML==5.3.1
+requests==2.19.1
+urllib3==1.23
+idna==2.7
